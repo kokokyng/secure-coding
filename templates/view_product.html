@@ -13,6 +13,7 @@
     &nbsp;|&nbsp;
     <form method="post" action="{{ url_for('delete_product', product_id=product.id) }}"
           style="display:inline" onsubmit="return confirm('정말 삭제하시겠습니까?');">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit" style="width:auto;display:inline;padding:2px 10px;">상품 삭제</button>
     </form>
   </p>

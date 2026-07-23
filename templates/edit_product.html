@@ -3,10 +3,11 @@
 {% block content %}
 <h2>상품 수정</h2>
 <form method="post">
-  제목: <input type="text" name="title" value="{{ product.title }}" required><br>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  제목: <input type="text" name="title" value="{{ product.title }}" maxlength="100" required><br>
   설명: <br>
-  <textarea name="description" rows="4" cols="50" required>{{ product.description }}</textarea><br>
-  가격: <input type="text" name="price" value="{{ product.price }}" required><br>
+  <textarea name="description" rows="4" cols="50" maxlength="2000" required>{{ product.description }}</textarea><br>
+  가격: <input type="text" name="price" value="{{ product.price }}" inputmode="numeric" pattern="[0-9]+" required><br>
   <button type="submit">수정 완료</button>
 </form>
 {% endblock %}

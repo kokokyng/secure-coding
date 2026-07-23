@@ -10,6 +10,7 @@
       {{ u.username }} (역할: {{ u.role }}, 상태: {{ u.status }}, 잔액: {{ u.balance }})
       {% if u.role != 'admin' %}
         <form method="post" action="{{ url_for('admin_toggle_user_status', user_id=u.id) }}" style="display:inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button type="submit" style="width:auto;display:inline;padding:2px 10px;">
             {{ '휴면 처리' if u.status == 'active' else '활성화' }}
           </button>
@@ -27,6 +28,7 @@
       <a href="{{ url_for('view_product', product_id=p.id) }}">[보기]</a>
       <form method="post" action="{{ url_for('admin_delete_product', product_id=p.id) }}" style="display:inline"
             onsubmit="return confirm('정말 삭제하시겠습니까?');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" style="width:auto;display:inline;padding:2px 10px;">삭제</button>
       </form>
     </li>
@@ -41,6 +43,7 @@
       / 처리 상태: {{ '완료' if r.resolved else '미처리' }}
       {% if not r.resolved %}
         <form method="post" action="{{ url_for('admin_resolve_report', report_id=r.id) }}" style="display:inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button type="submit" style="width:auto;display:inline;padding:2px 10px;">처리 완료</button>
         </form>
       {% endif %}
