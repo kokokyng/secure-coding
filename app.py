@@ -1,12 +1,15 @@
 import sqlite3
 import uuid
+from datetime import datetime
 from flask import Flask, render_template, request, redirect, url_for, session, flash, g
-from flask_socketio import SocketIO, send
+from flask_socketio import SocketIO, send, emit, join_room
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
 DATABASE = 'market.db'
 socketio = SocketIO(app)
+
+REPORT_THRESHOLD = 3  # 이 횟수 이상 신고되면 자동으로 차단/휴면 처리
 
 # 데이터베이스 연결 관리: 요청마다 연결 생성 후 사용, 종료 시 close
 def get_db():
@@ -22,7 +25,7 @@ def close_connection(exception):
     if db is not None:
         db.close()
 
-# 테이블 생성 (최초 실행 시에만)
+# 테이블 생성 (최초 실행 시에만) + 기존 DB 마이그레이션 + 관리자 계정 시딩
 def init_db():
     with app.app_context():
         db = get_db()
@@ -33,7 +36,10 @@ def init_db():
                 id TEXT PRIMARY KEY,
                 username TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
-                bio TEXT
+                bio TEXT,
+                balance INTEGER NOT NULL DEFAULT 100000,
+                role TEXT NOT NULL DEFAULT 'user',
+                status TEXT NOT NULL DEFAULT 'active'
             )
         """)
         # 상품 테이블 생성
@@ -43,7 +49,8 @@ def init_db():
                 title TEXT NOT NULL,
                 description TEXT NOT NULL,
                 price TEXT NOT NULL,
-                seller_id TEXT NOT NULL
+                seller_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active'
             )
         """)
         # 신고 테이블 생성
@@ -52,9 +59,94 @@ def init_db():
                 id TEXT PRIMARY KEY,
                 reporter_id TEXT NOT NULL,
                 target_id TEXT NOT NULL,
-                reason TEXT NOT NULL
+                reason TEXT NOT NULL,
+                resolved INTEGER NOT NULL DEFAULT 0
             )
         """)
+        # 1:1 채팅 메시지 테이블 생성
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS message (
+                id TEXT PRIMARY KEY,
+                room TEXT NOT NULL,
+                sender_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        # 송금 내역 테이블 생성
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS transfer (
+                id TEXT PRIMARY KEY,
+                sender_id TEXT NOT NULL,
+                receiver_id TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        db.commit()
+
+        # 이전 버전 스키마로 이미 생성된 DB를 위한 컬럼 추가 마이그레이션
+        for ddl in [
+            "ALTER TABLE user ADD COLUMN balance INTEGER NOT NULL DEFAULT 100000",
+            "ALTER TABLE user ADD COLUMN role TEXT NOT NULL DEFAULT 'user'",
+            "ALTER TABLE user ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+            "ALTER TABLE product ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+            "ALTER TABLE report ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0",
+        ]:
+            try:
+                cursor.execute(ddl)
+                db.commit()
+            except sqlite3.OperationalError:
+                pass  # 컬럼이 이미 존재함
+
+        # 기본 관리자 계정 시딩 (관리자가 하나도 없을 때만)
+        cursor.execute("SELECT * FROM user WHERE role = 'admin'")
+        if cursor.fetchone() is None:
+            cursor.execute(
+                "INSERT INTO user (id, username, password, bio, balance, role, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), 'admin', 'admin1234!', None, 0, 'admin', 'active')
+            )
+            db.commit()
+
+# 모든 템플릿에서 nav_user(현재 로그인한 사용자)를 사용할 수 있도록 주입
+@app.context_processor
+def inject_nav_user():
+    nav_user = None
+    if 'user_id' in session:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT * FROM user WHERE id = ?", (session['user_id'],))
+        nav_user = cursor.fetchone()
+    return dict(nav_user=nav_user)
+
+def is_admin_user():
+    if 'user_id' not in session:
+        return False
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT role FROM user WHERE id = ?", (session['user_id'],))
+    row = cursor.fetchone()
+    return bool(row and row['role'] == 'admin')
+
+def private_room_name(user_id_a, user_id_b):
+    return 'priv_' + '_'.join(sorted([user_id_a, user_id_b]))
+
+def apply_report_threshold(db, target_id):
+    """신고 누적 횟수가 임계치를 넘으면 대상 유저를 휴면 처리하거나 상품을 차단한다."""
+    cursor = db.cursor()
+    cursor.execute("SELECT COUNT(*) AS cnt FROM report WHERE target_id = ?", (target_id,))
+    count = cursor.fetchone()['cnt']
+    if count < REPORT_THRESHOLD:
+        return
+    cursor.execute("SELECT * FROM user WHERE id = ?", (target_id,))
+    if cursor.fetchone():
+        cursor.execute("UPDATE user SET status = 'suspended' WHERE id = ?", (target_id,))
+        db.commit()
+        return
+    cursor.execute("SELECT * FROM product WHERE id = ?", (target_id,))
+    if cursor.fetchone():
+        cursor.execute("UPDATE product SET status = 'blocked' WHERE id = ?", (target_id,))
         db.commit()
 
 # 기본 라우트
@@ -96,6 +188,9 @@ def login():
         cursor.execute("SELECT * FROM user WHERE username = ? AND password = ?", (username, password))
         user = cursor.fetchone()
         if user:
+            if user['status'] != 'active':
+                flash('휴면 처리된 계정입니다. 관리자에게 문의하세요.')
+                return redirect(url_for('login'))
             session['user_id'] = user['id']
             flash('로그인 성공!')
             return redirect(url_for('dashboard'))
@@ -111,7 +206,7 @@ def logout():
     flash('로그아웃되었습니다.')
     return redirect(url_for('index'))
 
-# 대시보드: 사용자 정보와 전체 상품 리스트 표시
+# 대시보드: 사용자 정보, 상품 검색/목록, 내 상품 목록 표시
 @app.route('/dashboard')
 def dashboard():
     if 'user_id' not in session:
@@ -121,12 +216,30 @@ def dashboard():
     # 현재 사용자 조회
     cursor.execute("SELECT * FROM user WHERE id = ?", (session['user_id'],))
     current_user = cursor.fetchone()
-    # 모든 상품 조회
-    cursor.execute("SELECT * FROM product")
-    all_products = cursor.fetchall()
-    return render_template('dashboard.html', products=all_products, user=current_user)
+    if current_user is None:
+        session.pop('user_id', None)
+        return redirect(url_for('login'))
 
-# 프로필 페이지: bio 업데이트 가능
+    query = request.args.get('q', '').strip()
+    if query:
+        like = f"%{query}%"
+        cursor.execute(
+            "SELECT * FROM product WHERE status = 'active' AND (title LIKE ? OR description LIKE ?) "
+            "ORDER BY rowid DESC",
+            (like, like)
+        )
+    else:
+        cursor.execute("SELECT * FROM product WHERE status = 'active' ORDER BY rowid DESC")
+    all_products = cursor.fetchall()
+
+    # 내가 등록한 상품 (상태 무관하게 모두 보여줌)
+    cursor.execute("SELECT * FROM product WHERE seller_id = ? ORDER BY rowid DESC", (session['user_id'],))
+    my_products = cursor.fetchall()
+
+    return render_template('dashboard.html', products=all_products, my_products=my_products,
+                           user=current_user, query=query)
+
+# 프로필 페이지: 소개글 및 비밀번호 업데이트
 @app.route('/profile', methods=['GET', 'POST'])
 def profile():
     if 'user_id' not in session:
@@ -134,10 +247,26 @@ def profile():
     db = get_db()
     cursor = db.cursor()
     if request.method == 'POST':
-        bio = request.form.get('bio', '')
-        cursor.execute("UPDATE user SET bio = ? WHERE id = ?", (bio, session['user_id']))
-        db.commit()
-        flash('프로필이 업데이트되었습니다.')
+        action = request.form.get('action')
+        if action == 'update_bio':
+            bio = request.form.get('bio', '')
+            cursor.execute("UPDATE user SET bio = ? WHERE id = ?", (bio, session['user_id']))
+            db.commit()
+            flash('프로필이 업데이트되었습니다.')
+        elif action == 'change_password':
+            current_password = request.form.get('current_password', '')
+            new_password = request.form.get('new_password', '')
+            confirm_password = request.form.get('confirm_password', '')
+            cursor.execute("SELECT * FROM user WHERE id = ?", (session['user_id'],))
+            current_user = cursor.fetchone()
+            if current_user['password'] != current_password:
+                flash('현재 비밀번호가 일치하지 않습니다.')
+            elif not new_password or new_password != confirm_password:
+                flash('새 비밀번호가 일치하지 않거나 비어 있습니다.')
+            else:
+                cursor.execute("UPDATE user SET password = ? WHERE id = ?", (new_password, session['user_id']))
+                db.commit()
+                flash('비밀번호가 변경되었습니다.')
         return redirect(url_for('profile'))
     cursor.execute("SELECT * FROM user WHERE id = ?", (session['user_id'],))
     current_user = cursor.fetchone()
@@ -149,15 +278,21 @@ def new_product():
     if 'user_id' not in session:
         return redirect(url_for('login'))
     if request.method == 'POST':
-        title = request.form['title']
-        description = request.form['description']
-        price = request.form['price']
+        title = request.form.get('title', '').strip()
+        description = request.form.get('description', '').strip()
+        price_raw = request.form.get('price', '').strip()
+        if not title or not description:
+            flash('제목과 설명을 입력해주세요.')
+            return redirect(url_for('new_product'))
+        if not price_raw.isdigit() or int(price_raw) <= 0:
+            flash('가격은 0보다 큰 숫자로 입력해주세요.')
+            return redirect(url_for('new_product'))
         db = get_db()
         cursor = db.cursor()
         product_id = str(uuid.uuid4())
         cursor.execute(
             "INSERT INTO product (id, title, description, price, seller_id) VALUES (?, ?, ?, ?, ?)",
-            (product_id, title, description, price, session['user_id'])
+            (product_id, title, description, price_raw, session['user_id'])
         )
         db.commit()
         flash('상품이 등록되었습니다.')
@@ -174,10 +309,158 @@ def view_product(product_id):
     if not product:
         flash('상품을 찾을 수 없습니다.')
         return redirect(url_for('dashboard'))
+
+    current_user_id = session.get('user_id')
+    is_owner = current_user_id == product['seller_id']
+
+    if product['status'] != 'active' and not is_owner and not is_admin_user():
+        flash('삭제되었거나 차단된 상품입니다.')
+        return redirect(url_for('dashboard'))
+
     # 판매자 정보 조회
     cursor.execute("SELECT * FROM user WHERE id = ?", (product['seller_id'],))
     seller = cursor.fetchone()
-    return render_template('view_product.html', product=product, seller=seller)
+    return render_template('view_product.html', product=product, seller=seller, is_owner=is_owner)
+
+# 상품 수정 (소유자만 가능)
+@app.route('/product/<product_id>/edit', methods=['GET', 'POST'])
+def edit_product(product_id):
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM product WHERE id = ?", (product_id,))
+    product = cursor.fetchone()
+    if not product:
+        flash('상품을 찾을 수 없습니다.')
+        return redirect(url_for('dashboard'))
+    if product['seller_id'] != session['user_id']:
+        flash('본인이 등록한 상품만 수정할 수 있습니다.')
+        return redirect(url_for('view_product', product_id=product_id))
+
+    if request.method == 'POST':
+        title = request.form.get('title', '').strip()
+        description = request.form.get('description', '').strip()
+        price_raw = request.form.get('price', '').strip()
+        if not title or not description or not price_raw.isdigit() or int(price_raw) <= 0:
+            flash('입력값을 확인해주세요.')
+            return redirect(url_for('edit_product', product_id=product_id))
+        cursor.execute(
+            "UPDATE product SET title = ?, description = ?, price = ? WHERE id = ?",
+            (title, description, price_raw, product_id)
+        )
+        db.commit()
+        flash('상품 정보가 수정되었습니다.')
+        return redirect(url_for('view_product', product_id=product_id))
+    return render_template('edit_product.html', product=product)
+
+# 상품 삭제 (소유자만 가능)
+@app.route('/product/<product_id>/delete', methods=['POST'])
+def delete_product(product_id):
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM product WHERE id = ?", (product_id,))
+    product = cursor.fetchone()
+    if not product:
+        flash('상품을 찾을 수 없습니다.')
+        return redirect(url_for('dashboard'))
+    if product['seller_id'] != session['user_id']:
+        flash('본인이 등록한 상품만 삭제할 수 있습니다.')
+        return redirect(url_for('view_product', product_id=product_id))
+    cursor.execute("DELETE FROM product WHERE id = ?", (product_id,))
+    db.commit()
+    flash('상품이 삭제되었습니다.')
+    return redirect(url_for('dashboard'))
+
+# 유저 간 송금
+@app.route('/transfer', methods=['GET', 'POST'])
+def transfer():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM user WHERE id = ?", (session['user_id'],))
+    current_user = cursor.fetchone()
+
+    if request.method == 'POST':
+        receiver_username = request.form.get('receiver_username', '').strip()
+        amount_raw = request.form.get('amount', '').strip()
+        if not amount_raw.isdigit() or int(amount_raw) <= 0:
+            flash('송금액은 0보다 큰 숫자로 입력해주세요.')
+            return redirect(url_for('transfer'))
+        amount = int(amount_raw)
+
+        cursor.execute("SELECT * FROM user WHERE username = ?", (receiver_username,))
+        receiver = cursor.fetchone()
+        if not receiver:
+            flash('존재하지 않는 사용자입니다.')
+            return redirect(url_for('transfer'))
+        if receiver['id'] == current_user['id']:
+            flash('본인에게는 송금할 수 없습니다.')
+            return redirect(url_for('transfer'))
+        if current_user['balance'] < amount:
+            flash('잔액이 부족합니다.')
+            return redirect(url_for('transfer'))
+
+        cursor.execute("UPDATE user SET balance = balance - ? WHERE id = ?", (amount, current_user['id']))
+        cursor.execute("UPDATE user SET balance = balance + ? WHERE id = ?", (amount, receiver['id']))
+        transfer_id = str(uuid.uuid4())
+        cursor.execute(
+            "INSERT INTO transfer (id, sender_id, receiver_id, amount, created_at) VALUES (?, ?, ?, ?, ?)",
+            (transfer_id, current_user['id'], receiver['id'], amount, datetime.utcnow().isoformat())
+        )
+        db.commit()
+        flash(f"{receiver['username']}님에게 {amount}원을 송금했습니다.")
+        return redirect(url_for('transfer'))
+
+    cursor.execute(
+        "SELECT t.*, su.username AS sender_name, ru.username AS receiver_name FROM transfer t "
+        "JOIN user su ON t.sender_id = su.id JOIN user ru ON t.receiver_id = ru.id "
+        "WHERE t.sender_id = ? OR t.receiver_id = ? ORDER BY t.created_at DESC",
+        (current_user['id'], current_user['id'])
+    )
+    history = cursor.fetchall()
+    cursor.execute("SELECT * FROM user WHERE id = ?", (session['user_id'],))
+    current_user = cursor.fetchone()
+    return render_template('transfer.html', user=current_user, history=history)
+
+# 1:1 채팅 상대 목록
+@app.route('/chat')
+def chat_list():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM user WHERE id != ? ORDER BY username", (session['user_id'],))
+    users = cursor.fetchall()
+    return render_template('chat_list.html', users=users)
+
+# 1:1 채팅방
+@app.route('/chat/<username>')
+def chat_room(username):
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM user WHERE username = ?", (username,))
+    other = cursor.fetchone()
+    if not other:
+        flash('사용자를 찾을 수 없습니다.')
+        return redirect(url_for('chat_list'))
+    if other['id'] == session['user_id']:
+        flash('본인과는 채팅할 수 없습니다.')
+        return redirect(url_for('chat_list'))
+
+    room = private_room_name(session['user_id'], other['id'])
+    cursor.execute(
+        "SELECT m.*, u.username AS sender_name FROM message m JOIN user u ON m.sender_id = u.id "
+        "WHERE m.room = ? ORDER BY m.created_at",
+        (room,)
+    )
+    history = cursor.fetchall()
+    return render_template('chat_room.html', other=other, room=room, history=history)
 
 # 신고하기
 @app.route('/report', methods=['GET', 'POST'])
@@ -185,8 +468,11 @@ def report():
     if 'user_id' not in session:
         return redirect(url_for('login'))
     if request.method == 'POST':
-        target_id = request.form['target_id']
-        reason = request.form['reason']
+        target_id = request.form.get('target_id', '').strip()
+        reason = request.form.get('reason', '').strip()
+        if not target_id or not reason:
+            flash('신고 대상과 사유를 입력해주세요.')
+            return redirect(url_for('report'))
         db = get_db()
         cursor = db.cursor()
         report_id = str(uuid.uuid4())
@@ -195,15 +481,125 @@ def report():
             (report_id, session['user_id'], target_id, reason)
         )
         db.commit()
+        apply_report_threshold(db, target_id)
         flash('신고가 접수되었습니다.')
         return redirect(url_for('dashboard'))
     return render_template('report.html')
+
+# 관리자 대시보드
+@app.route('/admin')
+def admin_dashboard():
+    if not is_admin_user():
+        flash('관리자만 접근할 수 있습니다.')
+        return redirect(url_for('dashboard'))
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM user ORDER BY rowid")
+    users = cursor.fetchall()
+    cursor.execute("SELECT * FROM product ORDER BY rowid DESC")
+    products = cursor.fetchall()
+    cursor.execute(
+        "SELECT r.*, "
+        "(SELECT username FROM user WHERE id = r.reporter_id) AS reporter_name "
+        "FROM report r ORDER BY r.rowid DESC"
+    )
+    reports = cursor.fetchall()
+    return render_template('admin_dashboard.html', users=users, products=products, reports=reports)
+
+# 관리자: 유저 활성/휴면 상태 토글
+@app.route('/admin/user/<user_id>/status', methods=['POST'])
+def admin_toggle_user_status(user_id):
+    if not is_admin_user():
+        flash('관리자만 접근할 수 있습니다.')
+        return redirect(url_for('dashboard'))
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM user WHERE id = ?", (user_id,))
+    target = cursor.fetchone()
+    if not target:
+        flash('사용자를 찾을 수 없습니다.')
+        return redirect(url_for('admin_dashboard'))
+    new_status = 'suspended' if target['status'] == 'active' else 'active'
+    cursor.execute("UPDATE user SET status = ? WHERE id = ?", (new_status, user_id))
+    db.commit()
+    flash(f"{target['username']}님의 상태를 {new_status}(으)로 변경했습니다.")
+    return redirect(url_for('admin_dashboard'))
+
+# 관리자: 상품 강제 삭제
+@app.route('/admin/product/<product_id>/delete', methods=['POST'])
+def admin_delete_product(product_id):
+    if not is_admin_user():
+        flash('관리자만 접근할 수 있습니다.')
+        return redirect(url_for('dashboard'))
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("DELETE FROM product WHERE id = ?", (product_id,))
+    db.commit()
+    flash('상품을 삭제했습니다.')
+    return redirect(url_for('admin_dashboard'))
+
+# 관리자: 신고 처리 완료 표시
+@app.route('/admin/report/<report_id>/resolve', methods=['POST'])
+def admin_resolve_report(report_id):
+    if not is_admin_user():
+        flash('관리자만 접근할 수 있습니다.')
+        return redirect(url_for('dashboard'))
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("UPDATE report SET resolved = 1 WHERE id = ?", (report_id,))
+    db.commit()
+    flash('신고를 처리 완료로 표시했습니다.')
+    return redirect(url_for('admin_dashboard'))
 
 # 실시간 채팅: 클라이언트가 메시지를 보내면 전체 브로드캐스트
 @socketio.on('send_message')
 def handle_send_message_event(data):
     data['message_id'] = str(uuid.uuid4())
     send(data, broadcast=True)
+
+# 1:1 채팅방 입장: 본인이 참여자인 방만 join 허용
+@socketio.on('join_private_room')
+def handle_join_private_room(data):
+    if 'user_id' not in session:
+        return
+    room = data.get('room', '')
+    if not room.startswith('priv_'):
+        return
+    participant_ids = room[len('priv_'):].split('_')
+    if session['user_id'] not in participant_ids:
+        return
+    join_room(room)
+
+# 1:1 채팅 메시지 전송: DB에 저장 후 해당 방에만 전달
+@socketio.on('send_private_message')
+def handle_send_private_message(data):
+    if 'user_id' not in session:
+        return
+    room = data.get('room', '')
+    message = (data.get('message') or '').strip()
+    if not room.startswith('priv_') or not message:
+        return
+    participant_ids = room[len('priv_'):].split('_')
+    if session['user_id'] not in participant_ids:
+        return
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT username FROM user WHERE id = ?", (session['user_id'],))
+    sender = cursor.fetchone()
+    message_id = str(uuid.uuid4())
+    created_at = datetime.utcnow().isoformat()
+    cursor.execute(
+        "INSERT INTO message (id, room, sender_id, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        (message_id, room, session['user_id'], message, created_at)
+    )
+    db.commit()
+    emit('private_message', {
+        'message_id': message_id,
+        'username': sender['username'],
+        'message': message,
+        'created_at': created_at
+    }, room=room)
 
 if __name__ == '__main__':
     init_db()  # 앱 컨텍스트 내에서 테이블 생성

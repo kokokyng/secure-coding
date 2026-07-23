@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}송금{% endblock %}
+{% block content %}
+<h2>송금</h2>
+<p>내 잔액: {{ user.balance }}원</p>
+<form method="post">
+  받는 사람 아이디: <input type="text" name="receiver_username" required><br>
+  송금액: <input type="text" name="amount" required><br>
+  <button type="submit">송금하기</button>
+</form>
+
+<h3>송금 내역</h3>
+<ul>
+  {% for t in history %}
+    <li>
+      {{ t.created_at }} -
+      {% if t.sender_id == user.id %}
+        {{ t.receiver_name }}님에게 {{ t.amount }}원 송금
+      {% else %}
+        {{ t.sender_name }}님에게서 {{ t.amount }}원 수신
+      {% endif %}
+    </li>
+  {% else %}
+    <li>송금 내역이 없습니다.</li>
+  {% endfor %}
+</ul>
+{% endblock %}

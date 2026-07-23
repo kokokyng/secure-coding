@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}{{ other.username }}님과의 채팅{% endblock %}
+{% block content %}
+<h2>{{ other.username }}님과의 1:1 채팅</h2>
+
+<div id="chat">
+  <ul id="messages">
+    {% for m in history %}
+      <li data-username="{{ m.sender_name }}" data-message="{{ m.content }}"></li>
+    {% endfor %}
+  </ul>
+  <input id="chat_input" type="text" placeholder="메시지를 입력하세요">
+  <button onclick="sendMessage()">전송</button>
+</div>
+
+<script type="text/javascript">
+  var room = "{{ room }}";
+
+  // 서버에서 전달한 기존 대화 내역을 안전하게(textContent) 렌더링
+  document.querySelectorAll('#messages li').forEach(function(li) {
+    li.textContent = li.dataset.username + ': ' + li.dataset.message;
+  });
+
+  var socket = io();
+  socket.on('connect', function() {
+    socket.emit('join_private_room', { room: room });
+  });
+  socket.on('private_message', function(data) {
+    var messages = document.getElementById('messages');
+    var item = document.createElement('li');
+    item.textContent = data.username + ": " + data.message;
+    messages.appendChild(item);
+    window.scrollTo(0, document.body.scrollHeight);
+  });
+  function sendMessage() {
+    var input = document.getElementById('chat_input');
+    var message = input.value;
+    if (message) {
+      socket.emit('send_private_message', { room: room, message: message });
+      input.value = "";
+    }
+  }
+</script>
+{% endblock %}
